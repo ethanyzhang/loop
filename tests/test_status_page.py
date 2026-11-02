@@ -369,6 +369,86 @@ class StatusPageTest(unittest.TestCase):
         self.assertTrue((self.out / "badge-goose.svg").is_file())
         self.assertNotIn("findings/goose/", self.html[:self.html.index('data-ecosystem="goose"')])
 
+    # Run age and the stale state, with a fixed clock
+
+    def built_at(self, now):
+        import datetime as dt
+        status_page.build(self.findings, ROOT / "versions.lock", self.out, now=dt.datetime.fromisoformat(now))
+        return (self.out / "index.html").read_text()
+
+    def test_a_fresh_live_run_shows_its_date_and_age_and_no_stale_state(self):
+        self.write(1, "PASS", population="live", date="2026-11-01")
+        page = self.built_at("2026-11-02T23:59:00+00:00")
+        self.assertIn("run dated 2026-11-01 · 1 day old (UTC, as of 2026-11-02)", page)
+        self.assertNotIn("stale", page.replace("--stale", "").replace(".stale", ""))
+        self.assertNotIn("data-stale", page)
+
+    def test_a_live_run_over_a_day_old_is_stale_in_its_column_and_on_the_page(self):
+        self.write(1, "PASS", population="live", date="2026-10-30")
+        page = self.built_at("2026-11-02T00:00:00+00:00")
+        self.assertIn("3 days old (UTC, as of 2026-11-02)", page)
+        self.assertIn('id="stale"', page)
+        self.assertIn("Stale: the newest live run of mesh is more than 1 day old", page)
+        self.assertEqual(page.count("data-stale"), 2)  # the live column of the steps table and of the ecosystems table
+        self.assertNotIn("data-stale", page[page.index('data-population="rehearsal"'):page.index('data-population="live"')])
+
+    def test_the_age_counts_utc_dates_not_hours(self):
+        self.write(1, "PASS", population="live", date="2026-11-01")
+        self.assertIn("0 days old", self.built_at("2026-11-01T00:00:01+00:00"))
+        self.assertIn("2 days old", self.built_at("2026-11-03T00:00:00+00:00"))
+        self.assertIn("1 day old", self.built_at("2026-11-01T20:00:00-06:00"))  # 2026-11-02 02:00 UTC
+
+    def test_two_days_old_is_already_stale(self):
+        self.write(1, "PASS", population="live", date="2026-10-31")
+        page = self.built_at("2026-11-02T00:00:00+00:00")
+        self.assertIn("2 days old", page)
+        self.assertIn('id="stale"', page)
+        self.assertIn("data-stale", page)
+
+    def test_a_single_ecosystem_page_has_the_banner_under_its_label_only(self):
+        import datetime as dt
+        d = self.findings / "muse"
+        self.findings, mesh = d, self.findings
+        self.write(1, "PASS", population="live", date="2026-10-28")
+        self.findings = mesh
+        status_page.build(d, ROOT / "versions.lock", self.out, "muse", now=dt.datetime(2026, 11, 2, tzinfo=dt.timezone.utc))
+        page = (self.out / "index.html").read_text()
+        banner = page[page.index('id="stale"'):]
+        banner = banner[:banner.index("</p>")]
+        self.assertIn("live run of consumer-agent is more than 1 day old", banner)
+        self.assertNotIn("muse", page.lower())
+
+    def test_a_stale_rehearsal_run_shows_its_age_but_is_not_stale(self):
+        self.write(1, "PASS", population="rehearsal", date="2026-10-01")
+        page = self.built_at("2026-11-02T00:00:00+00:00")
+        self.assertIn("32 days old", page)
+        self.assertNotIn("data-stale", page)
+        self.assertNotIn('id="stale"', page)
+
+    def test_no_live_run_is_no_age_and_no_stale_claim(self):
+        self.write(1, "PASS")
+        page = self.built_at("2026-11-02T00:00:00+00:00")
+        self.assertNotIn('id="stale"', page)
+        self.assertNotIn("data-stale", page)
+
+    def test_each_ecosystem_column_is_stale_on_its_own_run(self):
+        self.write(1, "PASS", population="live", date="2026-11-02")
+        goose = self.findings / "goose"
+        self.findings, mesh = goose, self.findings
+        self.write(1, "PASS", population="live", date="2026-10-28")
+        self.findings = mesh
+        page = self.built_at("2026-11-02T12:00:00+00:00")
+        self.assertIn("Stale: the newest live run of goose is more than 1 day old", page)
+        self.assertNotIn("of mesh", page[page.index('id="stale"'):page.index('id="stale"') + 120])
+        self.assertEqual(page.count('data-ecosystem="goose" data-stale'), 1)
+        self.assertEqual(page.count('data-ecosystem="mesh" data-stale'), 0)
+
+    def test_the_page_never_sums_ages_and_the_age_line_claims_nothing_checked(self):
+        self.write(1, "PASS", population="live", date="2026-10-30")
+        page = self.built_at("2026-11-02T00:00:00+00:00")
+        for m in re.finditer(r"run dated[^<]*(?:<strong[^>]*>[^<]*</strong>)?", page):
+            self.assertIsNone(CLAIMS.search(m.group(0)), m.group(0))
+
     def test_rehearsal_and_live_stay_apart(self):
         self.write(1, "PASS")
         self.write(1, "FAIL", population="live")
