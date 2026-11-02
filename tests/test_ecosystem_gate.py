@@ -219,6 +219,25 @@ class GateTest(unittest.TestCase):
         gate.write(self.baseline, doc)
         self.assertEqual(len(gate.cmd_verify(self.baseline)), 1)
 
+    def test_a_goose_only_pin_moves_no_mesh_baseline(self):
+        lock = self.dir / "versions.lock"
+        lock.write_text(LOCK.read_text() + "goose-g1 action-state-group/evidencebook 0123456789abcdef\n")
+        self.assertNotIn("goose-g1", gate.lock_pins(lock, eco="mesh"))
+        self.assertIn("goose-g1", gate.lock_pins(lock, eco="goose"))
+        # a mesh baseline recorded before the pin was owned by Goose still verifies after the pin moves
+        self.update("a", {"01": "PASS"})
+        doc = json.loads(self.baseline.read_text())
+        doc["ecosystems"]["mesh"]["pins"]["goose-g1"] = "action-state-group/evidencebook old"
+        gate.write(self.baseline, doc)
+        self.assertEqual(gate.cmd_verify(self.baseline), [])
+        # and an update that no longer records it is not "the pin set changed" against that older baseline
+        new = self.dir / "new.json"
+        gate.write(new, json.loads(self.baseline.read_text()))
+        doc2 = json.loads(new.read_text())
+        del doc2["ecosystems"]["mesh"]["pins"]["goose-g1"]
+        gate.write(new, doc2)
+        self.assertEqual(gate.cmd_check(self.baseline, new), [])
+
     def test_pin_comments_are_not_pins(self):
         other = self.dir / "versions.lock"
         other.write_text("# a new comment\n" + LOCK.read_text())
