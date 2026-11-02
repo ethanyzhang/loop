@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -37,7 +38,8 @@ NAMES = ("goose-1", "goose-2")  # goose-1 sells, goose-2 buys
 RELAY = "wss://relay.loop-lab.example"
 ANSWERS_WITHIN = "PT1M"  # the shortest window an absence may claim; the nodes answer only while a run polls them
 POLL_INTERVAL = 30
-STEPS = ["01", "03", "07"]  # the steps this driver gives a Goose input (06 waits on the live rail, loop#349)
+STEPS = ["01", "03", "07"]  # the steps a session gives a Goose input; `session --pay` adds 06 (one real payment, loop#349)
+PRICE_MSAT, CURRENCY, DECIMALS = 1000, "BTC", 11  # the paid deal's price in msat (BTC at assetScale 11, as the lab's band)
 SRC = Path(os.environ["LOOP_GOOSE_SRC"]) / "python" / "examples" / "goose" if "LOOP_GOOSE_SRC" in os.environ else None
 
 
@@ -66,6 +68,61 @@ async def with_nodes(homes, work, relay_map=None):
             await session.initialize()
             nodes[name] = Goose(session, name)
         return await work(nodes)
+
+
+def checkpoint_key_id(published, node_id):
+    """A node's checkpoint key id, read from the commitment it published (history_cards[0].checkpoint_key, base64url of
+    the Ed25519 SPKI): no join, which would seal one more record in a lab node."""
+    import base64
+    doc = json.loads((Path(published) / f"{node_id}.json").read_text())
+    raw = doc["history_cards"][0]["checkpoint_key"]
+    return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))[-32:].hex()
+
+
+async def pay_deal(nodes, ids, step06, pay_one, settled):
+    """One deal goose-2 buys from goose-1 over a real Lightning payment: G1's calls as goose_session.py makes them, except
+    the rail. `pay_one()` (goose_lightning.pay on the lab wallets) pays once both sides hold the agreed terms and returns
+    the record step 06 reads; the buyer's loop_settle commits its payment_hash and loop_pay_opening opens it. Writes
+    DIR (step06): the halves, the opening, each node's signed settlement disclosure and lightning.json."""
+    buyer, seller = nodes["goose-2"], nodes["goose-1"]
+    b, s = ids["goose-2"], ids["goose-1"]  # each: key_id, checkpoint_key_id
+    step06.mkdir(parents=True, exist_ok=True)
+    await buyer.call("loop_admit", peer_key_id=s["key_id"], checkpoint_key_id=s["checkpoint_key_id"],
+                     decision="GO", reason="known inference seller")
+    await seller.call("loop_admit", peer_key_id=b["key_id"], checkpoint_key_id=b["checkpoint_key_id"],
+                      decision="GO", reason="paying customer")
+    opened = await buyer.call("loop_deal_open", peer_key_id=s["key_id"], item="inference: 1k tokens",
+                              price_minor=PRICE_MSAT, currency=CURRENCY, rail="lightning",
+                              asked="buy 1k tokens of inference from the seller")
+    deal_id, tmp = opened["deal_id"], step06 / "tmp"
+    tmp.mkdir(exist_ok=True)
+    await buyer.call("loop_deal_push", deal_id=deal_id, out_path=str(tmp / "buyer-half.json"))
+    await seller.call("loop_deal_respond", request_file=str(tmp / "buyer-half.json"),
+                      asked="sell 1k tokens of inference at the listed price")
+    await seller.call("loop_deal_push", deal_id=deal_id, out_path=str(tmp / "seller-half.json"))
+    await buyer.call("loop_deal_reconcile", peer_file=str(tmp / "seller-half.json"))
+    record = await asyncio.get_running_loop().run_in_executor(None, pay_one)  # the one real payment
+    await buyer.call("loop_settle", deal_id=deal_id, payment_ref=record["payment_hash"])
+    for me in (buyer, seller):
+        await me.call("loop_deal_end_exchange", deal_id=deal_id, out_path=str(tmp / f"{me.name}-exchange-half.json"))
+    for me, peer in ((buyer, seller), (seller, buyer)):
+        await peer.call("loop_deal_reconcile", peer_file=str(tmp / f"{me.name}-exchange-half.json"))
+    await buyer.call("loop_deal_close", deal_id=deal_id, status="received")
+    await seller.call("loop_deal_close", deal_id=deal_id, status="received")
+    await buyer.call("loop_pay_opening", deal_id=deal_id, out_path=str(step06 / "buyer-pay-opening.json"))
+    record["payments_recorded"] = settled(record["payment_hash"], deal_id)  # both books hold the deal now
+    for node in (buyer, seller):  # the rail has no ledger sequence: 0
+        await node.call("loop_settlement_disclosure", rail="lightning", through_sequence=0,
+                        out_path=str(step06 / f"disclosure-{node.name}.json"))
+    for me, peer in ((buyer, seller), (seller, buyer)):
+        path = str(tmp / f"{me.name}-final-half.json")
+        await me.call("loop_deal_push", deal_id=deal_id, out_path=path)
+        await peer.call("loop_deal_reconcile", peer_file=path)
+    shutil.copyfile(tmp / f"{buyer.name}-final-half.json", step06 / "buyer-half.json")
+    shutil.copyfile(tmp / f"{seller.name}-final-half.json", step06 / "seller-half.json")
+    shutil.rmtree(tmp)
+    (step06 / "lightning.json").write_text(json.dumps({**record, "deal_id": deal_id}, indent=2, sort_keys=True) + "\n")
+    return deal_id
 
 
 def public_key(producer_key):
@@ -134,11 +191,28 @@ def cmd_session(a):
     ids = json.loads((run / "nodes.json").read_text())
     pop = work / "population"
     pop.mkdir(exist_ok=True)
+    steps, lightning = list(STEPS), None
+    if a.pay:  # 06: one real Lightning payment, lab wallet to lab wallet, inside the guard (scripts/goose_lightning.py)
+        import goose_lightning as gl
+        payer, payee = gl.Wallet(a.payer_port, a.payer_name), gl.Wallet(a.payee_port, a.payee_name)
+        log = Path(a.lightning_log)
+        gl.preflight(payer, payee, gl.AMOUNT_MSAT, log)  # refuse before the nodes start the deal
+        node_ids = {n: {**d, "checkpoint_key_id": checkpoint_key_id(a.published, d["key_id"])}
+                    for n, d in json.loads(Path(a.ids).read_text()).items()}
+
+        async def deal(nodes):
+            return await pay_deal(nodes, node_ids, pop / "step06", lambda: gl.pay(payer, payee, log),
+                                  lambda h, d: gl.mark_settled(log, h, d, f"{payer.name}>{payee.name}"))
+        asyncio.run(with_nodes(a.homes, deal))
+        steps.append("06")
+        lightning = {"payer": payer.name, "payee": payee.name, "file": "step06/lightning.json"}
     nodes = [{"name": n, "node_id": ids[n]["key_id"], "key_dir": str(Path(a.keys) / n)} for n in NAMES]
     doc = {"population": "live", "nodes": nodes, "pinned": ["goose-g1"],
            "goose": {"run": str(work), "log": str(work / "session.log"), "rev": rev, "capsule_emit": emit,
-                     "steps": STEPS, "sealed": {"node": "goose-2", "capsule": str(sealed)},
+                     "steps": steps, "sealed": {"node": "goose-2", "capsule": str(sealed)},
                      "asks": {"run": str(run), "log": str(work / "session.log")}}}
+    if lightning:
+        doc["goose"]["lightning"] = lightning
     (pop / "population.json").write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
 
 
@@ -158,7 +232,15 @@ def main(argv=None):
             p.add_argument("--keys", type=Path, required=True)
             p.add_argument("--ids", type=Path, required=True)
             p.add_argument("--work", type=Path, required=True)
+            p.add_argument("--pay", action="store_true", help="also make the one real Lightning payment (step 06)")
+            p.add_argument("--payer-port", type=int, default=9811, help="the payer lab node's console port (lab-1)")
+            p.add_argument("--payee-port", type=int, default=9812, help="the payee lab node's console port (lab-2)")
+            p.add_argument("--payer-name", default="lab-1")
+            p.add_argument("--payee-name", default="lab-2")
+            p.add_argument("--lightning-log", type=Path, help="the payment log (the guard's count); needed with --pay")
     a = ap.parse_args(argv)
+    if a.cmd == "session" and a.pay and not a.lightning_log:
+        ap.error("--pay needs --lightning-log")
     if SRC is None:
         raise SystemExit("set LOOP_GOOSE_SRC to the Goose checkout (steps/goose.setup.sh installs it)")
     {"init": cmd_init, "advertise": cmd_advertise, "session": cmd_session}[a.cmd](a)
