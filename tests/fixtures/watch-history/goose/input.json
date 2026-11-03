@@ -52,11 +52,10 @@
   }
  ],
  "sharing": {
-  "adjudications": "deliver_to_subjects",
-  "exchange_corroboration": true,
-  "history_segments": "counterparties",
-  "record_at_completion": "counterparty",
-  "standard_history": true
+  "share_deal_half": "counterparty",
+  "stranger_safe": [
+   "history_card/1"
+  ]
  },
  "surface": "neutral",
  "view": "history-view/v0"
