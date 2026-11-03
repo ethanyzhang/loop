@@ -6,8 +6,11 @@ Usage: watch.py [--daily DIR] [--rehearsal DIR] [--ondemand DIR] [--findings DIR
        (defaults: stats/data/daily, stats/data/rehearsal, no on-demand set, findings, nodes, population,
         lab/runs, no bindings, no lock, _site)
 
-Writes DIR/watch/index.html, data.json, watch.js, watch-layout.js and the
-vendored d3 (vendor/d3-7.9.0/), served at <pages root>/watch/. Run it after
+Writes DIR/watch/index.html, data.json, watch.js, watch-layout.js, the
+vendored d3 (vendor/d3-7.9.0/) and, for each node stream whose advertised policy
+says everything the shared capsule-viewer History view needs, its page
+(history/<node_id>/<stream>.html, drawn by the vendored vendor/capsule-viewer-0.14.0/),
+served at <pages root>/watch/. Run it after
 site/build.py, which empties DIR.
 
 data.json is the export the page draws (its keys are in site/README.md). It
@@ -47,13 +50,19 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "steps"))
+sys.path.insert(0, str(ROOT / "scripts"))
 import stats_model  # noqa: E402
 import finding  # noqa: E402
+import history_cards as hc  # noqa: E402
 
 layout = stats_model.layout
 PAGE = "watch"
 FORMAT = "watch/2"
 D3 = "vendor/d3-7.9.0"
+# The shared History view (capsule-viewer, evidence-network/loop#360): its script and stylesheet, as released.
+VIEWER = "vendor/capsule-viewer-0.14.0"
+HISTORY_DIR = "history"
+POLICY_PROFILE = "disclosure-policy/0"
 # The graph's own size, in SVG units: the layout and the seeds are inside it.
 SIZE = (760, 520)
 # The reporter backend's own asks in a step 07 proof come from the node it runs on.
@@ -183,6 +192,12 @@ def witnesses(result):
 COMMUNITIES = {"mesh-llm": "mesh-llm", "muse": "personal-agents", "goose": "goose"}
 
 
+def staples(commitment):
+    """(the stapled card entries as the page reads them, whether it is a single /0 `history_card`)."""
+    got = commitment.get("history_cards", commitment.get("history_card"))
+    return (got if isinstance(got, list) else [got] if isinstance(got, dict) else []), not isinstance(got, list)
+
+
 def history_cards(commitment):
     """The history cards stapled to a commitment: each its stream, community, witnesses and whether it has history.
 
@@ -194,9 +209,7 @@ def history_cards(commitment):
     stream is new or a cleared one started again: `since` is the day the
     stream started (the card's `stream_started`, else the day it was issued).
     Nothing of a card but these."""
-    got = commitment.get("history_cards", commitment.get("history_card"))
-    one = not isinstance(got, list)
-    entries = got if isinstance(got, list) else [got] if isinstance(got, dict) else []
+    entries, one = staples(commitment)
     out = []
     for c in entries:
         if not isinstance(c, dict):
@@ -214,6 +227,120 @@ def history_cards(commitment):
                     "witnesses": witnesses(result), "history": history,
                     "since": None if history or not isinstance(since, str) else since[:10]})
     return out
+
+
+# --- History pages: the shared capsule-viewer History view, one page per node and stream ----------------------
+
+# A node's advertised disclosure-policy/0 member -> the History view's `sharing` member, and what each may be.
+SHARES = (("share_standard_history", "standard_history", {"on": True, "off": False}),
+          ("share_history_segments", "history_segments", {"off": "off", "counterparties": "counterparties", "peers": "peers"}),
+          ("share_record_at_completion", "record_at_completion", {"counterparty": "counterparty", "off": "off"}),
+          ("share_adjudications", "adjudications", {"deliver_to_subjects": "deliver_to_subjects", "off": "off"}),
+          ("share_exchange_corroboration", "exchange_corroboration", {"on": True, "off": False}))
+
+
+def sharing(policy_doc):
+    """The View's `sharing` from a node's advertised disclosure-policy/0, or None when it does not say every
+    member the view requires or says one the view does not know. Nothing is assumed for what it leaves out:
+    `adjudicate_differing_twins` and `witnesses` are not advertised and are left absent, which the view allows."""
+    policy = policy_doc.get("policy") if isinstance(policy_doc, dict) else None
+    if not (isinstance(policy_doc, dict) and policy_doc.get("profile") == POLICY_PROFILE and isinstance(policy, dict)):
+        return None
+    out = {}
+    for src, dst, allowed in SHARES:
+        v = policy.get(src)
+        if not isinstance(v, str) or v not in allowed:
+            return None
+        out[dst] = allowed[v]
+    return out
+
+
+def history_input(node_id, stream, answer, policy_doc, built_at):
+    """(the `history-view/v0` input for one stream of a node, None) or (None, why no page can be written).
+
+    Built from what the card itself says, with nothing verified here: each checkpoint of the card's history is a
+    row (its issued_at, its log_size, its anchor the SHA-256 of the checkpoint statement), every signature,
+    witness and second-signature slot unchecked. A card whose checkpoints cannot be read is `unreadable`."""
+    if not isinstance(stream, str) or not stream:
+        return None, "stream"
+    if not isinstance(built_at, str):
+        return None, "issued_at"
+    if not isinstance(policy_doc, dict):
+        return None, "nopolicy"
+    share = sharing(policy_doc)
+    if share is None:
+        return None, "policy"
+    rows, readable = [], True
+    for statement, payload in hc.card_statements(answer):
+        issued, size = (payload or {}).get("issued_at"), (payload or {}).get("log_size")
+        try:
+            anchor = hashlib.sha256(bytes.fromhex(statement)).hexdigest()
+        except (ValueError, TypeError):
+            anchor = None
+        if not (isinstance(issued, str) and isinstance(size, int) and not isinstance(size, bool) and anchor):
+            readable = False
+            break
+        rows.append({"kind": "checkpoint", "cut_at": issued, "log_size": size, "anchor": anchor,
+                     "signature": "not_run", "witness": {"state": "not_checked"},
+                     "second_signature": {"state": "not_checked"}})
+    doc = {"view": "history-view/v0", "kind": "checkpoint", "surface": "neutral", "reader": "recipient",
+           "holder": {"node": node_id, "stream": stream}, "audience": {"kind": "anyone"}, "built_at": built_at,
+           "checked": {"where": "builder", "by": "loop site/watch.py"},
+           "checks": [{"id": "checkpoint_signatures", "status": "not_run"},
+                      {"id": "checkpoint_chain", "status": "not_run"}],
+           "sharing": share}
+    if not readable:
+        return doc | {"outcome": {"kind": "unreadable"}, "rows": []}, None
+    return doc | {"rows": rows}, None
+
+
+def slug(stream, taken):
+    """A file name for a stream, unique among the node's: its characters outside [A-Za-z0-9._-] become '-'."""
+    base = re.sub(r"[^A-Za-z0-9._-]", "-", stream).strip("-.") or "stream"
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = f"{base}-{n}"
+    taken.add(name)
+    return name
+
+
+def history_pages(node_id, commitment, policy_doc):
+    """[(card index, relative page path or None, input or None, why not)] for each stapled card, in the order
+    `history_cards` lists them: the page path and input when it can be drawn, else why it cannot ("stream": the card
+    names no stream, "issued_at": the commitment has no issue time, "nopolicy": the node has no advertised policy
+    file, "policy": its advertised policy does not say everything the view needs)."""
+    entries, one = staples(commitment)
+    taken, out = set(), []
+    for i, c in enumerate(entries):
+        if not isinstance(c, dict):
+            continue
+        answer = hc.card_answer(c)
+        stream = c.get("stream")
+        if not isinstance(stream, str):
+            stream = (hc.card_result(answer) or {}).get("evidence_stream") if answer else None
+        doc, why = history_input(node_id, stream, answer, policy_doc, commitment.get("issued_at"))
+        out.append((len(out), f"{HISTORY_DIR}/{node_id}/{slug(stream, taken)}.html" if doc else None, doc, why))
+    return out
+
+
+HISTORY_CSS = (HERE / VIEWER / "history-view.css").read_text(encoding="utf-8")
+
+
+def history_page(doc):
+    """The static page for one input: the view's stylesheet inline, its script as vendored, the input as JSON."""
+    blob = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    # Inside a script block "<" and "&" must not start a tag, a comment or an entity: a stream name is the node's own.
+    blob = blob.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    title = f"History · node {doc['holder']['node'][:12]} · {doc['holder']['stream']}"
+    return ("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            f"<title>{e(title)}</title><style>{HISTORY_CSS}</style></head><body>\n"
+            "<p><a href=\"../../index.html\">Back to the watch page</a></p>\n<div id=\"history\"><noscript>This page needs script to draw the history.</noscript></div>\n"
+            f"<script type=\"application/json\" id=\"history-input\">{blob}</script>\n"
+            f"<script src=\"../../{VIEWER}/history-view.iife.js\"></script>\n"
+            "<script>HistoryView.renderHistoryView(JSON.parse(document.getElementById(\"history-input\").textContent), "
+            "document.getElementById(\"history\"));</script>\n</body></html>\n")
 
 
 # --- Controller bindings --------------------------------------------------------
@@ -643,7 +770,8 @@ def metrics(v):
 
 
 def export(daily, rehearsal, findings, nodes_dir, population_dir, commitments_dir="lab/runs", ondemand=None,
-           bindings_dir=None, lock=None):
+           bindings_dir=None, lock=None, pages=None):
+    """The export. `pages`, a dict, is filled with each History page's input by its path under the watch page."""
     by_id, by_key = listing(nodes_dir)
     root = Path(findings).resolve().parent
 
@@ -664,7 +792,13 @@ def export(daily, rehearsal, findings, nodes_dir, population_dir, commitments_di
     for nid in used:
         n = ({k: by_id[nid].get(k) for k in NODE_FIELDS} | {"listed": True}) if nid in by_id else {"listed": False}
         path, c = held.get(nid, (None, {}))
-        nodes[nid] = n | {"seed": seed(nid), "commitment": path, "history_cards": history_cards(c), "binding": None}
+        cards = history_cards(c)
+        policy = read_json(Path(nodes_dir) / "commitments" / "policies" / f"{nid}.json")
+        for i, page, doc, why in history_pages(nid, c, policy):
+            cards[i]["page" if page else "no_page"] = page or why
+            if pages is not None and page:
+                pages[page] = doc
+        nodes[nid] = n | {"seed": seed(nid), "commitment": path, "history_cards": cards, "binding": None}
     groups, notes = bindings(bindings_dir, lock, by_id, by_key, rel)
     groups = [g | {"subjects": [x for x in g["subjects"] if x in nodes]} for g in groups]
     for g in groups:
@@ -759,18 +893,26 @@ def render(data):
 
 def build(daily, rehearsal, findings, nodes_dir, population_dir, out, commitments_dir="lab/runs", ondemand=None,
           bindings_dir=None, lock=None):
+    pages = {}
     data = export(daily, rehearsal, findings, nodes_dir, population_dir, commitments_dir, ondemand,
-                  bindings_dir, lock)  # raise before anything is written
+                  bindings_dir, lock, pages)  # raise before anything is written
     site = Path(out) / PAGE
     if site.exists():
         shutil.rmtree(site)
     (site / D3).mkdir(parents=True)
+    (site / VIEWER).mkdir(parents=True)
     (site / "data.json").write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     (site / "index.html").write_text(render(data), encoding="utf-8")
     for f in ("watch.js", "watch-layout.js"):
         shutil.copyfile(HERE / f, site / f)
     for f in ("d3.min.js", "LICENSE"):
         shutil.copyfile(HERE / D3 / f, site / D3 / f)
+    for rel, doc in pages.items():
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel).write_text(history_page(doc), encoding="utf-8")
+    if pages:
+        for f in ("history-view.iife.js", "LICENSE", "LICENSE-BSD-3-Clause"):
+            shutil.copyfile(HERE / VIEWER / f, site / VIEWER / f)
     return data
 
 
