@@ -10,7 +10,7 @@
 #   1. take $LAB_DIR/run/LIVE_RUN (asg-lab-rebuild skips a host that has one); refuse when it exists, or when a
 #      lab.sh or loop.sh process runs; the lock is removed on every exit, a kill included (not SIGKILL)
 #   2. lab/lab.sh tools installs every step's pinned tools for this head into LIVE_TOOLS, then lab/lab.sh check and
-#      lab/lab.sh running: a setup that fails, pin drift, or a node down or on another build stops the run. tools comes
+#      lab/lab.sh running: a setup that fails, pin drift, a node down or on another build, or the lab's test witness down stops the run. tools comes
 #      first because check fails on the last tools record: a day whose tools failed is retried the next day
 #   3. the window: this run's start, at its whole minute (the plugin stamps records to the minute), goes into
 #      population/live/population.json as window.from for steps 06-08 and into LOOP_SEALED_SINCE for 05; the file
@@ -220,7 +220,7 @@ rc=$?
 bounded "$LAB_SH" running
 rc=$?
 [ "$rc" = 0 ] || [ "$rc" = 1 ] || refuse 5 "lab.sh running exited $rc"
-[ "$rc" = 0 ] || refuse 5 "lab.sh running failed: a node is down or runs another build"
+[ "$rc" = 0 ] || refuse 5 "lab.sh running failed: a node or the test witness is down, or a node runs another build (see its stderr)"
 
 # --- 3. the window --------------------------------------------------------------------------------------------------
 POP_TOUCHED=1

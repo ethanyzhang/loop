@@ -9,7 +9,8 @@
 #             on every outcome, and exits 1 naming each failure
 #   running   confirm every lab node is up and runs the checked build: its process is MESH_LLM_BIN and one of its
 #             plugin processes is CAPSULES_BIN (by sha256 of /proc/<pid>/exe, so Linux only); exits 1 naming each
-#             failure. Starts and stops nothing
+#             failure. When the lab has a test witness (run/witness.sh exists), it must be alive and serving its
+#             port too: the live run's paid exchange is not started without it (loop#372). Starts and stops nothing
 #   tools     install every step's pinned tools (each steps/*.setup.sh: the steps' own and the shared ledger-check
 #             one): runs every setup, records each one's exit code in build.json, and exits 1 if any failed
 #   start     lab-1 makes the mesh and serves the model; lab-2 and lab-3 join it. No relay.
@@ -696,6 +697,7 @@ cmd_running() {
   if [ "$DRY" = 1 ]; then
     say sha256sum "$MESH_LLM_BIN" "$CAPSULES_BIN"
     for n in "${NODES[@]}"; do echo "  ($n: pid $(pidfile "$n") alive, /proc/<pid>/exe and a plugin child's exe compared by sha256)"; done
+    echo "  (if $LAB_DIR/run/witness.sh exists: pid $(pidfile witness) alive and port $(witness_port) listening)"
     return 0
   fi
   mesh_sha=$(sha256sum < "$MESH_LLM_BIN" | cut -d' ' -f1) || die "cannot read MESH_LLM_BIN"
@@ -711,6 +713,11 @@ cmd_running() {
     done
     [ "$found" = 1 ] || fails+=("$n (pid $p) runs no CAPSULES_BIN plugin process")
   done
+  # The witness is no node, so `start` and a node restart never bring it back; a lab that had one must say when it is gone.
+  # A pid file outlives a crash or a reboot and its pid can be reused, so the port it serves is checked too.
+  if [ -e "$LAB_DIR/run/witness.sh" ] && { ! alive witness || port_free "$(witness_port)"; }; then
+    fails+=("the test witness is down (no live process in $(pidfile witness) serving port $(witness_port)): run lab/lab.sh witness")
+  fi
   if [ "${#fails[@]}" -gt 0 ]; then
     printf 'lab.sh: running: %s\n' "${fails[@]}" >&2
     return 1
@@ -834,7 +841,11 @@ cmd_witness() {
     run env XDG_CONFIG_HOME="$(home_of "$n")/join-book/config" "$(capsulectl_bin)" profile update --profile "$n" \
       --checkpoint-endpoint "https://127.0.0.1:$(witness_port)" --checkpoint-public-key "$pub"
   done
-  if [ "$DRY" = 0 ] && alive witness; then echo "witness already running (pid $(pid_of witness))"; return 0; fi
+  # A live pid that serves no port (a reused pid, a wedged process) is not a running witness: start a new one, whose
+  # launcher overwrites the pid file, and signal nothing.
+  if [ "$DRY" = 0 ] && alive witness && ! port_free "$(witness_port)"; then
+    echo "witness already running (pid $(pid_of witness))"; return 0
+  fi
   [ "$DRY" = 1 ] || port_free "$(witness_port)" || die "port $(witness_port) is in use: pick another LAB_PORT_BASE"
   local body
   body=$(

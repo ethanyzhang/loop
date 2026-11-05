@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -752,6 +753,30 @@ class ToolsTest(LabRoot):
         self.setup_script("01-a", "exit 0")
         self.assertEqual(self.run_lab("tools").returncode, 0)
         self.assertEqual(self.build()["failures"], ["lab/lab.sh check has not run"])
+
+    def test_running_names_a_dead_witness_only_when_the_lab_has_one(self):
+        # loop#372: the witness is no node, so a restart left it down and step 02 read NOT_CHECKED for days.
+        (self.lab / "run").mkdir(parents=True)
+        r = self.run_lab("running")
+        self.assertNotIn("witness", r.stderr)  # no run/witness.sh: no witness to ask for
+        (self.lab / "run" / "witness.sh").write_text("#!/bin/sh\n")
+        r = self.run_lab("running")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("the test witness is down", r.stderr)
+        self.assertIn("lab/lab.sh witness", r.stderr)
+        sleeper = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(sleeper.kill)
+        (self.lab / "run" / "witness.pid").write_text(f"{sleeper.pid}\n")
+        base = 20000 + os.getpid() % 20000
+        # A live pid that is not serving the witness port (a reused pid, a wedged process) is still a dead witness.
+        r = self.run_lab("running", LAB_PORT_BASE=str(base))
+        self.assertIn("the test witness is down", r.stderr)
+        if not shutil.which("ss"):  # lab.sh reads listeners with ss (Linux, like the rest of `running`)
+            return
+        with socket.socket() as srv:
+            srv.bind(("127.0.0.1", base + 30))
+            srv.listen(1)
+            self.assertNotIn("witness", self.run_lab("running", LAB_PORT_BASE=str(base)).stderr)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed: lab.sh start cannot be run")
