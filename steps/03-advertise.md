@@ -55,6 +55,63 @@ Per-node inputs are read from `DIR/advertise/<name>/` (`commitment.json`
 with the settings below, `history_card.json`, `checkpoint.json`). A
 rehearsal node without them gets stand-ins, and the finding says so.
 
+## The second carrier: Nostr
+
+A node that advertises its commitment on Nostr (the switch is off by default)
+publishes it as an addressable announce event: kind `34700`, a placeholder
+with no NIP of ours (AAC evidence-commitment carriers v0 §5.3), signed by the
+mailbox key its commitment names in `ask.nostr`, with the commitment octets in
+base64url as `content`. The step reads the event back and compares its octets
+with the git carrier's bytes.
+
+**Rehearsal** reads recorded relay responses, so CI needs no relay:
+`advertise/<name>/nostr.json` is `{"read_at": <UTC time>, "relays": {<wss URL>:
+[<event>, ...]}}`, what a `REQ {"kinds":[34700], "#d":[<node_id>]}` returned.
+`advertise/<name>/signed/{commitment,policy}.json`, when present, is a
+commitment signed beforehand and published byte for byte (the harness signs
+nothing at run time). The recording is kept in the proof as `<name>.nostr.json`.
+The live read-back against a real producer waits on
+Mesh-LLM/capsules-plugin#212; the live population reads no relay yet.
+
+A node with no `nostr.json` is reported `not advertised on nostr`, a note in
+its verification record and never a failure. For a node with one, the node
+passes only when the newest valid commitment on its relays is announced by the
+node and is byte for byte the git carrier's, and both pass the checks above.
+The verifier trusts only the octets: each event is read for them and the
+octets are verified on their own (AAC §6 V0 to V4): the fields, the Ed25519
+signature, the node's key, and the `node_id` equal to the event's `d`. The
+policy and staples are checked on the git carrier's bytes; another commitment's
+policy is not on the git carrier, so its policy digest is not matched to bytes.
+
+Every commitment that verifies is ranked by `issued_at`, whoever posted it
+(arrival order and carrier never decide); the author only labels it. An event
+by the mailbox key that the event's own commitment names is *announced*; the
+same octets by any other key are *relayed*. Failures carry a named reason in
+the record's `errors`:
+
+| Reason | When |
+|---|---|
+| `nostr.no_events` | no relay returned an event for this node |
+| `nostr.event_form` | not kind 34700, a malformed tag, field or content, a string no UTF-8 encoding holds, or a `d` tag that is not this node's id |
+| `nostr.event_id`, `nostr.event_signature` | the NIP-01 id or the BIP-340 signature does not verify (a forged event) |
+| `nostr.digest_mismatch` | the `x` tag is not the sha256 of the octets |
+| `nostr.octets_form`, `nostr.octets_invalid` | the octets are not a commitment, or fail the checks above (an edited commitment fails its Ed25519 signature) |
+| `nostr.future_dated` | every commitment is dated after the recording's `read_at` plus five minutes |
+| `nostr.no_mailbox_route` | the git commitment names no `ask.nostr`, so no event can be the node's |
+| `nostr.not_announced` | the current commitment has only relayed events: another key than the one its own commitment names |
+| `nostr.relays_conflict` | the newest commitments have the same `issued_at` and different octets; both versions are reported |
+| `nostr.bytes_differ` | the current commitment is not the git carrier's bytes (a newer commitment, even under a rotated mailbox key or another policy, makes the git copy stale) |
+| `nostr.over_size` (NOT_CHECKED) | an event by the node's own key carries no octets (an `r` tag) and could change the outcome: its digest is one no inline commitment has, or it names the git bytes while a stale inline commitment is current (never when the git bytes are older than the read allows). Fetching them is not done here; an outsider's events never turn this into a FAIL. The same event beside an outsider's copy of the git bytes counts as the node's announcement of them |
+| `nostr.recording` | `nostr.json` is not a JSON object (FAIL), or `read_at` is missing or not `YYYY-MM-DDTHH:MM:SSZ` (NOT_CHECKED) |
+
+An event that fails by itself (forged, edited, malformed, a commitment for
+another node, future-dated, relayed copy of the current one) is listed under
+`events.rejected` or `events.relayed` and does not fail a node that also has a
+good announce event: relays are open, so anyone can post such events. An older
+commitment beside a newer one is listed under `events.superseded`; the newer is
+read back. Relay timestamps are not evidence; the commitment's `issued_at`
+decides.
+
 ## Fields
 
 Two profiles verify. `evidence-commitment/0` staples one history card;
