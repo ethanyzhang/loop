@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Helpers for .github/workflows/live-daily.yml, sourced by its steps. The lab host, project, zone and lab user come from
+# environment secrets (LIVE_VM, LIVE_PROJECT, LIVE_ZONE, LIVE_LAB_USER; secrets are masked in every log line, including step headers); nothing about the
+# operator's infrastructure is committed. Each remote call runs the one command the host's sudoers rule allows.
+set -u
+
+for v in LIVE_VM LIVE_PROJECT LIVE_ZONE LIVE_LAB_USER; do
+  [ -n "${!v:-}" ] || { echo "::error::environment secret $v is not set"; return 2 2> /dev/null || exit 2; }
+  echo "::add-mask::${!v}"
+done
+export CLOUDSDK_CORE_PROJECT=$LIVE_PROJECT CLOUDSDK_CORE_DISABLE_PROMPTS=1
+
+setstate() { echo "LIVE_STATE=$1" >> "$GITHUB_ENV"; LIVE_STATE=$1; }
+
+vm() { # SUBCOMMAND: start | status | stage
+  timeout 150 gcloud compute ssh "$LIVE_VM" --zone "$LIVE_ZONE" --tunnel-through-iap --quiet --verbosity=error --strict-host-key-checking=no --ssh-flag=-q \
+    --command "sudo -n -u $LIVE_LAB_USER /usr/local/sbin/loop-live-ci-entry $1" < /dev/null
+}
+
+start_run() {
+  local out rc
+  # A harvest-only dispatch (after a failed harvest) starts nothing: it polls the result of today's run.
+  if [ "${HARVEST_ONLY:-false}" = true ]; then setstate waiting; return 0; fi
+  out=$(vm start 2>&1) && rc=0 || rc=$?
+  echo "$out"
+  case $rc in
+    0) setstate waiting ;;
+    10 | 11) setstate skipped; echo "::notice::live run not started: $(echo "$out" | grep -a -E '^(skipped|refused):' | head -1)" ;;
+    *) setstate failed; echo "::error::the run did not start (exit $rc)"; return 1 ;;
+  esac
+}
+
+# Poll for up to MINUTES; one transient ssh failure (255) is tolerated five times in a row.
+wait_run() {
+  local end=$((SECONDS + $1 * 60)) bad=0 out rc
+  while [ "$SECONDS" -lt "$end" ]; do
+    out=$(vm status 2>&1) && rc=0 || rc=$?
+    case $rc in
+      20) bad=0 ;;
+      0) echo "$out"
+         # live_daily.sh's own exit code: 0, 1 and 8 are packed runs; 3 is a busy lab (a skip); the rest ran and packed nothing.
+         case $(sed -n 's/^rc=//p' <<< "$out" | tail -1) in
+           0 | 1 | 8) setstate done ;;
+           3) setstate skipped; echo "::notice::the lab was busy" ;;
+           *) setstate failed; echo "::error::the run ended without a pack"; return 1 ;;
+         esac
+         return 0 ;;
+      21) echo "$out"; setstate failed; return 1 ;;
+      22) echo "$out"; setstate timeout; return 1 ;;
+      *) bad=$((bad + 1)); [ "$bad" -ge 5 ] && { echo "$out"; setstate failed; echo "::error::status unreachable"; return 1; } ;;
+    esac
+    sleep 120
+  done
+  return 0
+}
+
+# The pull request is opened with GITHUB_TOKEN, which starts no pull_request workflow: start each required check by
+# dispatch on the harvest branch, so it reports on the pull request's head commit.
+dispatch_checks() { # BRANCH
+  local wf failed=0
+  for wf in nodes reports personal-data leak-lint dco stats harvest-allowlist ecosystem-gate versions; do
+    gh workflow run "$wf.yml" --ref "$1" || { echo "::error::could not dispatch $wf on $1"; failed=1; }
+  done
+  return $failed
+}
+
+harvest() {
+  local out name rc
+  out=$(vm stage 2>&1) && rc=0 || rc=$?
+  echo "$out"
+  [ "$rc" = 0 ] || { setstate failed; echo "::error::stage failed (exit $rc)"; return 1; }
+  name=$(sed -n 's/^name=\([^ ]*\) .*/\1/p' <<< "$out")
+  [[ $name =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-live-[1-9][0-9]*$ ]] || { echo "::error::bad run name"; return 1; }
+  git config user.name "github-actions[bot]"
+  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+  rc=0
+  out=$(LIVE_HARVEST_IAP=1 LIVE_HARVEST_VM=$LIVE_VM LIVE_HARVEST_ZONE=$LIVE_ZONE LIVE_HARVEST_REMOTE_DIR=/tmp/loop-live-out-$name \
+    python3 -B scripts/live_harvest.py --name "$name" < /dev/null 2>&1) || rc=$?
+  echo "$out"
+  # A harvest-only retry after the branch was pushed: the pull request exists; only the checks may be missing.
+  if [ "$rc" = 4 ] && grep -q "origin already has live-harvest/$name" <<< "$out"; then
+    echo "::notice::the findings branch exists; dispatching its checks again"
+    dispatch_checks "live-harvest/$name" || { setstate harvest-failed; return 1; }
+    return 0
+  fi
+  echo "harvest_rc=$rc" >> "$GITHUB_ENV"
+  # exit 0: PR open and the baseline moved; 1: PR open, baseline unmoved (a regression or a refused payment)
+  if [ "$rc" = 0 ] || [ "$rc" = 1 ]; then dispatch_checks "live-harvest/$name" || { setstate harvest-failed; return 1; }; fi
+  [ "$rc" = 1 ] && echo "::warning::findings PR opened; the baseline did not move (regression or refused payment)"
+  [ "$rc" -le 1 ] || { setstate harvest-failed; return 1; }
+}
+
+report_failure() { # STATE
+  local title="loop-live-failed" n body
+  body="The daily live run on $(date -u +%F) did not complete: state \`$1\`. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+  n=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+  if [ -n "$n" ]; then gh issue comment "$n" --body "$body"
+  else gh issue create --title "$title" --body "$body"; fi
+}
