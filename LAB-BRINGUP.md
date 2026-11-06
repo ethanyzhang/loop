@@ -613,7 +613,11 @@ names the one gap outside it (no public ledger, loop#247). `pack` takes
 What a paid exchange costs, measured live on 2026-11-01 (loop#300; lab-2 pays,
 lab-1 sells the Qwen model; the lab host build's mesh-llm payments code):
 - The loop sets no amount. `lab.sh exchange` sends one `max_tokens` 8 request from
-  each of lab-2 and lab-3; only lab-2 has a wallet, so one exchange is paid. For a
+  each of lab-2 and lab-3; only lab-2's wallet is funded (lab-3's is configured and
+  empty, `spendable_msat` 0), so one exchange is paid and lab-3's is refused with 402
+  (its 1,000 msat charge row goes to `failed`; loop#384). The daily run records lab-3's
+  status and judges nothing on it; lab-3 keeps asking because step 04 judges
+  its book's admission decisions (stevenmih-3: 6 judged in live-2 of 2026-11-06). For a
   cold peer the amount is lab-1's admission deposit for the model: its own
   deposit, else the node-wide `admission-deposit`, else the minimum payment, and
   never below the minimum payment. The minimum payment is 1,000 msat by default,
@@ -632,8 +636,8 @@ lab-1 sells the Qwen model; the lab host build's mesh-llm payments code):
   leaves a payment hash in the payer's book alone, which step 06 reads as unproven
   (`finality`) and unpaired (`exchange_match`), so do not probe on the live lab
   before a run.
-- Only lab-1 serves a model, so payments go lab-2 to lab-1 (or lab-3 to lab-1,
-  which has no wallet); the wallets cannot ping-pong today.
+- Only lab-1 serves a model, so payments go lab-2 to lab-1 (lab-3 to lab-1 fails
+  while lab-3's wallet is unfunded); the wallets cannot ping-pong today.
 - The lab payment guard (Ethan, 2026-11-01) is at most 3,000 msat per payment and
   at most 9,000 msat per direction per UTC day, not lifetime. It matches lab-2's
   wallet policy `daily_budget_msat` 9,000 (`wallet policy`), which the wallet

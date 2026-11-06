@@ -15,8 +15,8 @@
 #   3. the window: this run's start, at its whole minute (the plugin stamps records to the minute), goes into
 #      population/live/population.json as window.from for steps 06-08 and into LOOP_SEALED_SINCE for 05; the file
 #      is restored on exit
-#   4. one lab/lab.sh exchange: the one paid exchange (lab-2 pays lab-1 1,000 msat; lab-3 asks too and has no
-#      settlement), never retried. If lab-2's request does not succeed, step 06 is written here NOT_CHECKED, stating
+#   4. one lab/lab.sh exchange: the one paid exchange (lab-2 pays lab-1 1,000 msat; lab-3 asks too, and its wallet is
+#      unfunded, so lab-1 refuses it with 402 and it settles nothing; loop#384), never retried. If lab-2's request does not succeed, step 06 is written here NOT_CHECKED, stating
 #      the HTTP status seen (loop#321)
 #   5. wait LIVE_CHECKPOINT_WAIT seconds (default 360) for each node's checkpoint over the exchange
 #   6. steps 04, 05, bundles, 06, 09, stage 1 (01 02 03 12 07, then 08, which reproduces the earlier ones), 10, 11,
@@ -247,6 +247,10 @@ case "$paid_status" in
 esac
 [ -z "$refused" ] && [ "$exchange_rc" -ne 0 ] && log "lab.sh exchange exited $exchange_rc after lab-2's paid exchange; the steps judge what was recorded"
 [ -n "$refused" ] && log "$refused; step 06 is NOT_CHECKED, no retry"
+# lab-3 asks only so its book has an admission decision for step 04; its wallet is unfunded, so the 402 is expected (loop#384).
+# Recorded, never judged: nothing in a step reads it.
+lab3_status=$(status_line "$LAB_DIR/exchange/lab-3.headers.txt")
+log "lab-3's unpaid request to lab-1 got '${lab3_status:-no HTTP answer}' (its wallet is unfunded; a 402 is expected)"
 
 # --- 5. the checkpoints ---------------------------------------------------------------------------------------------
 log "waiting ${WAIT}s for the checkpoints"
@@ -336,15 +340,16 @@ mkdir -p "$OUT_DIR" || refuse 2 "cannot make $OUT_DIR"
 tar czf "$OUT_DIR/$NAME.tgz.tmp" -C "$ROOT" "findings/$NAME" && mv "$OUT_DIR/$NAME.tgz.tmp" "$OUT_DIR/$NAME.tgz" \
   || refuse 2 "cannot write $OUT_DIR/$NAME.tgz"
 (cd "$OUT_DIR" && sha256 "$NAME.tgz" > "$NAME.tgz.sha256") || refuse 2 "cannot hash $NAME.tgz"
-python3 -B - "$OUT" "$OUT_DIR/$NAME.json" "$NAME" "$HEAD" "$STARTED_AT" "$SINCE" "$refused" "$paid_status" "$gate_rc" << 'PY'
+python3 -B - "$OUT" "$OUT_DIR/$NAME.json" "$NAME" "$HEAD" "$STARTED_AT" "$SINCE" "$refused" "$paid_status" "$gate_rc" "$lab3_status" << 'PY'
 import json, sys
 from pathlib import Path
-out, path, name, head, started, since, refused, status, gate_rc = sys.argv[1:]
+out, path, name, head, started, since, refused, status, gate_rc, lab3_status = sys.argv[1:]
 steps = {}
 for f in sorted(Path(out).glob("*/finding.json")):
     steps[f.parent.name] = json.loads(f.read_text())["result"]
 run = {"name": name, "head": head, "started": started, "window_from": since,
-       "exchange": {"paid": not refused, "status": status or None, "refused": refused or None},
+       "exchange": {"paid": not refused, "status": status or None, "refused": refused or None,
+                    "lab3_status": lab3_status or None},
        "steps": steps, "gate_check_rc": int(gate_rc)}
 Path(path).write_text(json.dumps(run, indent=2, sort_keys=True) + "\n")
 for step, result in steps.items():

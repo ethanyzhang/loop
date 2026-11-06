@@ -45,6 +45,7 @@ case "$cmd" in
   exchange)
     mkdir -p "$LAB_DIR/exchange"
     printf 'HTTP/1.1 %s\r\nx-mesh-served-by: x\r\n' "${STUB_PAID:-200 OK}" > "$LAB_DIR/exchange/lab-2.headers.txt"
+    printf 'HTTP/1.1 402 Payment Required\r\n' > "$LAB_DIR/exchange/lab-3.headers.txt"
     case "${STUB_PAID:-200 OK}" in 200*) ;; *) exit 22 ;; esac ;;
   admit) [ -n "${STUB_HANG:-}" ] && sleep 60; w 04-admit PASS ;;
   deal) w 05-deal PASS ;;
@@ -132,6 +133,7 @@ class LiveDailyTest(unittest.TestCase):
         self.assertFalse(out.exists())
         record = json.loads((self.lab / "out" / f"{name}.json").read_text())
         self.assertTrue(record["exchange"]["paid"])
+        self.assertEqual(record["exchange"]["lab3_status"], "HTTP/1.1 402 Payment Required")  # recorded, not judged (loop#384)
         self.assertEqual(record["steps"]["06-settle"], "PASS")
         self.assertEqual(record["steps"]["08-verify"], "NOT_CHECKED")
         self.assertEqual(record["head"], git("rev-parse", "HEAD", cwd=self.clone))
