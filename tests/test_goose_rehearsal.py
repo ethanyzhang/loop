@@ -1,5 +1,5 @@
 """The Goose rehearsal driver (scripts/goose_rehearsal.py, loop#330): G1's two nodes, the mock rail paying their deal, step 01
-judging the capsule the buyer sealed with loop_seal, step 03 the commitment each node signed with loop_advertise, and step 06 reading G1's own pay record and the nodes' own signed settlement disclosures against the rail (01, 02, 03, 04, 05, 06 and 07 pass). Skipped unless steps/goose.setup.sh has installed the
+judging the capsule the buyer sealed with loop_seal, step 03 the commitment each node signed with loop_advertise, and step 06 reading G1's own pay record and the nodes' own signed settlement disclosures against the rail (01, 02, 03, 04, 05, 06, 07 and 12 pass). Skipped unless steps/goose.setup.sh has installed the
 Goose tools; the step 01 test also needs steps/01-seal.setup.sh's verifier, step 04 capsulectl, and the step 02 tests the step 02 driver, capsulectl and
 openssl 3 (steps/02-book.setup.sh, steps/12-join.setup.sh).
 
@@ -45,7 +45,7 @@ class GooseRehearsalTest(unittest.TestCase):
         doc = json.loads((self.pop / "population.json").read_text())
         self.assertEqual([n["name"] for n in doc["nodes"]], ["buyer", "seller"])
         self.assertEqual(doc["rail"], "mock")
-        self.assertEqual(doc["goose"]["steps"], ["01", "02", "03", "04", "05", "06", "07"])
+        self.assertEqual(doc["goose"]["steps"], ["01", "02", "03", "04", "05", "06", "07", "12"])
 
     def test_step_03_passes_on_the_commitments_the_goose_nodes_signed(self):
         out = self.work / "findings" / "03-advertise"
@@ -513,6 +513,119 @@ class GooseRehearsalTest(unittest.TestCase):
         for out, found in (self._step_04(pop, "truncated-f4"), self._step_05(pop, "truncated-f5")):
             self.assertEqual(found["result"], "FAIL", found["detail"])
             self.assertTrue((out / "checks.json").is_file())
+
+    def _step_12(self, pop, name, env=None):
+        out = self.work / name / "12-join"
+        r = subprocess.run([str(ROOT / "steps/12-join"), "--population", str(pop), "--out", str(out)],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, env={**os.environ, **(env or {})})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return out, json.loads((out / "finding.json").read_text())
+
+    def test_step_12_passes_on_the_joined_nodes_commitments_and_a_strangers_history_card_probe(self):
+        self._step_04_ready()
+        out, found = self._step_12(self.pop, "findings")
+        self.assertEqual(found["result"], "PASS", found["detail"])
+        self.assertIn("probe backend: goose", found["detail"])
+        self.assertEqual(sorted(found["pinned"]), ["capsulectl", "capsulectl-book", "goose-g1"])
+        paths = {x["path"] for x in found["proof"]}
+        self.assertTrue({"buyer/asks/seller/history_card/answer.json", "seller/asks/buyer/history_card/outcome.bundle.json",
+                         "buyer/advertised/commitment.json"} <= paths)
+
+    def test_step_12_fails_what_a_planted_asks_session_breaks(self):
+        self._step_04_ready()
+        import shutil
+
+        def planted(name, mutate):
+            doc = json.loads((self.pop / "population.json").read_text())
+            run = self.work / f"{name}-asks12"
+            shutil.copytree(self.work / "asks", run, ignore=shutil.ignore_patterns("run"))
+            doc["goose"]["asks"]["run"] = str(run)
+            mutate(run)
+            pop = self.work / f"{name}-pop12"
+            pop.mkdir()
+            (pop / "population.json").write_text(json.dumps(doc))
+            return self._step_12(pop, f"{name}-f12")[1]
+
+        def other_key(run):  # the node joined as another key than its commitment is for
+            n = json.loads((run / "nodes.json").read_text())
+            n["buyer"]["key_id"] = "00" * 32
+            (run / "nodes.json").write_text(json.dumps(n))
+
+        def no_probe(run):
+            shutil.rmtree(run / "seller" / "asks" / "buyer" / "history_card")
+
+        def altered_reply(run):
+            p = run / "seller" / "asks" / "buyer" / "history_card" / "answer.json"
+            p.write_bytes(p.read_bytes() + b" ")
+
+        def forged_commitment(run):  # a binding added after the node signed
+            p = run / "buyer" / "advertised" / "commitment.json"
+            c = json.loads(p.read_text())
+            c["controller_binding"] = {"digest": "11" * 32}
+            p.write_text(json.dumps(c))
+
+        def no_join_record(run):
+            (run / "buyer" / "joined" / "join-record.bundle.json").unlink()
+
+        def other_join_record(run):  # the seller's join record presented as the buyer's
+            shutil.copyfile(run / "seller" / "joined" / "join-record.bundle.json",
+                            run / "buyer" / "joined" / "join-record.bundle.json")
+
+        def one_node(run):  # a session that joined only one of the population's nodes
+            n = json.loads((run / "nodes.json").read_text())
+            del n["seller"]
+            (run / "nodes.json").write_text(json.dumps(n))
+
+        for name, mutate, text in (("otherkey", other_key, "joined as"), ("noprobe", no_probe, "no history_card/1 probe"),
+                                   ("reply", altered_reply, "history_card"), ("forged", forged_commitment, "commitment"),
+                                   ("nojoin", no_join_record, "no join record was exported"),
+                                   ("otherjoin", other_join_record, "not the node's goose_joined record"),
+                                   ("onenode", one_node, "the population lists")):
+            with self.subTest(name):
+                found = planted(name, mutate)
+                self.assertEqual(found["result"], "FAIL", found["detail"])
+                self.assertIn(text, found["detail"])
+
+    def test_step_12_judge_refuses_a_binding_and_a_probe_that_is_not_the_history_card_probe(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("step12_join_tests", str(ROOT / "steps" / "12-join"))
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        self.assertEqual(mod.goose_binding_errors("buyer", {"key_id": "x"}), [])
+        self.assertIn("names a controller binding", mod.goose_binding_errors("buyer", {"controller_binding": {}})[0])
+        s07 = mod.load_step07()
+        adv = {"subjects": ["checkpoints"], "derivations": ["history_card/1"]}
+        probe = dict(s07.ASKS["history_card"]["request"], nonce="n", deadline="2026-01-01T00:00:00Z", profile="evidence-interop/0")
+        self.assertEqual(mod.goose_probe_errors(s07, probe, adv), [])
+        self.assertTrue(mod.goose_probe_errors(s07, {**probe, "derivation": "other/1"}, adv))  # another derivation
+        self.assertTrue(mod.goose_probe_errors(s07, {**probe, "subject": {"exchange": "x"}}, adv))  # another subject
+        self.assertTrue(mod.goose_probe_errors(s07, {**probe, "coverage": {"min_freshness": 9}}, adv))  # other coverage
+        self.assertTrue(mod.goose_probe_errors(s07, probe, {**adv, "derivations": []}))  # not advertised
+
+    def test_step_12_is_not_checked_on_a_checkout_other_than_the_pin(self):
+        self._step_04_ready()
+        doc = json.loads((self.pop / "population.json").read_text())
+        doc["goose"]["rev"] = "0" * 40
+        pop = self.work / "otherrev-pop12"
+        pop.mkdir()
+        (pop / "population.json").write_text(json.dumps(doc))
+        found = self._step_12(pop, "otherrev-f12")[1]
+        self.assertEqual(found["result"], "NOT_CHECKED", found["detail"])
+        self.assertEqual(found["not_checked"][0]["what"], "the Goose nodes' join and a stranger's probe")
+
+    def test_step_12_is_not_checked_without_capsulectl(self):
+        found = self._step_12(self.pop, "nocap-f12", {"CAPSULECTL": str(self.work / "no-such-capsulectl")})[1]
+        self.assertEqual(found["result"], "NOT_CHECKED", found["detail"])
+        self.assertIn("is not installed", found["detail"])
+
+    def test_step_12_is_not_checked_when_the_run_wrote_no_asks_session(self):
+        doc = json.loads((self.pop / "population.json").read_text())
+        doc["goose"].pop("asks")
+        pop = self.work / "noasks-pop12"
+        pop.mkdir()
+        (pop / "population.json").write_text(json.dumps(doc))
+        self.assertEqual(self._step_12(pop, "noasks-f12")[1]["result"], "NOT_CHECKED")
 
     def test_step_07_passes_on_asks_the_goose_nodes_answer_by_polling_their_mailboxes(self):
         out = self.work / "findings" / "07-ask"

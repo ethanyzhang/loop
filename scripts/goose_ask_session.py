@@ -21,6 +21,7 @@ points both nodes at the local one. Each outcome (the response or the absence) i
 
 Layout, as steps/07-ask judges the book backend (<asker>/asks/<asked>/<ask>/, <asked>/advertised/):
   nodes.json
+  <node>/joined/<key_id>.json, policies/<key_id>.json (loop_join's commitment), join-record.bundle.json (the join record, disclosed): step 12
   <node>/advertised/commitment.json, policies/<node_id>.json
   <asker>/asks/<asked>/carrier.jsonl
   <asker>/asks/<asked>/<ask>/request.json, answer.json, outcome.bundle.json (+ the files loop_book_bundle writes beside it)
@@ -133,7 +134,13 @@ async def run(out, relay, names=NAMES, homes=None, published=None, relay_name=AD
             await bs.initialize()
             await ss.initialize()
             nodes = {names[0]: Goose(bs, names[0]), names[1]: Goose(ss, names[1])}
-            joined = joined or {name: await g.call("loop_join") for name, g in nodes.items()}
+            rehearsal = not joined  # the lab passes its first joins; the rehearsal joins here and keeps what loop_join gave
+            joined = joined or {name: await g.call("loop_join", commitment_dir=str(out / name / "joined"))
+                                for name, g in nodes.items()}
+            if rehearsal:  # step 12: the join record as an Evidence Bundle, its header disclosed
+                for name, g in nodes.items():
+                    await g.call("loop_book_bundle", book_id="goose/node", record_id=joined[name]["record_id"],
+                                 disclose=True, out_path=str(out / name / "joined" / "join-record.bundle.json"))
             for name, g in nodes.items():
                 adv = out / name / "advertised"
                 node_id = joined[name]["key_id"]
