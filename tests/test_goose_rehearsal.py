@@ -1,6 +1,7 @@
 """The Goose rehearsal driver (scripts/goose_rehearsal.py, loop#330): G1's two nodes, the mock rail paying their deal, step 01
-judging the capsule the buyer sealed with loop_seal, step 03 the commitment each node signed with loop_advertise, and step 06 reading G1's own pay record and the nodes' own signed settlement disclosures against the rail (01, 03, 06 and 07 pass). Skipped unless steps/goose.setup.sh has installed the
-Goose tools; the step 01 test also needs steps/01-seal.setup.sh's verifier.
+judging the capsule the buyer sealed with loop_seal, step 03 the commitment each node signed with loop_advertise, and step 06 reading G1's own pay record and the nodes' own signed settlement disclosures against the rail (01, 02, 03, 06 and 07 pass). Skipped unless steps/goose.setup.sh has installed the
+Goose tools; the step 01 test also needs steps/01-seal.setup.sh's verifier, and the step 02 tests the step 02 driver, capsulectl and
+openssl 3 (steps/02-book.setup.sh, steps/12-join.setup.sh).
 
 Run: python3 -m unittest tests.test_goose_rehearsal -v
 """
@@ -44,7 +45,7 @@ class GooseRehearsalTest(unittest.TestCase):
         doc = json.loads((self.pop / "population.json").read_text())
         self.assertEqual([n["name"] for n in doc["nodes"]], ["buyer", "seller"])
         self.assertEqual(doc["rail"], "mock")
-        self.assertEqual(doc["goose"]["steps"], ["01", "03", "06", "07"])
+        self.assertEqual(doc["goose"]["steps"], ["01", "02", "03", "06", "07"])
 
     def test_step_03_passes_on_the_commitments_the_goose_nodes_signed(self):
         out = self.work / "findings" / "03-advertise"
@@ -91,6 +92,161 @@ class GooseRehearsalTest(unittest.TestCase):
         found = json.loads((out / "finding.json").read_text())
         self.assertNotIn("goose-g1", found["pinned"])
         self.assertEqual(json.loads((out / "checks.json").read_text())["sealed_by"], "given capsule")
+
+    def _step_02(self, pop, name):
+        out = self.work / name / "02-book"
+        r = subprocess.run([str(ROOT / "steps/02-book"), "--population", str(pop), "--out", str(out)],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return out, json.loads((out / "finding.json").read_text())
+
+    def _step_02_ready(self):
+        sys.path.insert(0, str(ROOT / "steps"))
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("step02_book_tests", str(ROOT / "steps" / "02-book"))
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        _, missing = mod.capsulectl()
+        if mod.driver() is None or missing or not mod.openssl_ed25519():
+            if os.environ.get("LOOP_REQUIRE_TOOLS"):
+                self.fail(f"step 02 tools missing: driver {mod.driver()}, {missing}")
+            self.skipTest("run steps/02-book.setup.sh and steps/12-join.setup.sh (and have openssl 3)")
+
+    def test_step_02_passes_on_the_book_bundle_and_witness_receipt_the_goose_node_wrote(self):
+        self._step_02_ready()
+        out, found = self._step_02(self.pop, "findings")
+        self.assertEqual(found["result"], "PASS", found["detail"])
+        checks = json.loads((out / "checks.json").read_text())["checks"]
+        self.assertEqual(sorted(checks), ["bundle", "checkpoint", "membership", "position", "record", "signer",
+                                          "witness_listed", "witness_not_before", "witness_not_node", "witness_signature"])
+        # the bytes judged are the ones loop_book_bundle wrote, not ones the step made
+        self.assertEqual((out / "bundle.json").read_bytes(), (self.work / "run" / "book-bundle-buyer.json").read_bytes())
+        self.assertIn("goose-g1", found["pinned"])
+
+    def _planted(self, name, mutate):
+        """Step 02's checks.json on a copy of the run with `mutate(run, book)` applied: (finding, checks)."""
+        import shutil
+        doc = json.loads((self.pop / "population.json").read_text())
+        run = self.work / f"{name}-run"
+        shutil.copytree(self.work / "run", run, ignore=shutil.ignore_patterns("buyer", "seller", "*.key", "witness-key.pem"))
+        book = {**doc["goose"]["book"], "bundle": str(run / "book-bundle-buyer.json"),
+                "witnesses": str(run / "witnesses.json")}
+        mutate(run, book)
+        doc["goose"]["book"] = book
+        pop = self.work / f"{name}-pop"
+        pop.mkdir()
+        (pop / "population.json").write_text(json.dumps(doc))
+        out, found = self._step_02(pop, name)
+        return found, json.loads((out / "checks.json").read_text())["checks"]
+
+    def test_step_02_fails_each_check_a_planted_bundle_or_receipt_breaks(self):
+        self._step_02_ready()
+
+        def bundle(run):
+            return json.loads((run / "book-bundle-buyer.json").read_text())
+
+        def save(run, b):
+            (run / "book-bundle-buyer.json").write_text(json.dumps(b))
+
+        def altered(run, book):  # a record altered after it was sealed
+            b = bundle(run)
+            next(r for r in b["records"] if r["capsule_id"] == b["root"])["operator"] = "someone-else"
+            save(run, b)
+
+        def unlisted(run, book):  # a witness listing that does not list the receipt's key
+            (run / "witnesses.json").write_text(json.dumps({"witnesses": [{
+                "name": "w", "key_id": "00" * 32, "not_before": "2026-01-01T00:00:00Z"}]}))
+
+        def not_yet(run, book):  # a listing whose entry counts receipts only from after this one
+            w = json.loads((run / "witnesses.json").read_text())
+            w["witnesses"][0]["not_before"] = "2999-01-01T00:00:00Z"
+            (run / "witnesses.json").write_text(json.dumps(w))
+
+        def signed_by(pem):  # a receipt really signed by a key of one of the run's nodes, and that key listed
+            def mutate(run, book):
+                driver = TOOLS.parent / "02-book" / "bin" / "loop-step02-book"
+                got = json.loads(subprocess.run(
+                    [str(driver), "lab-receipt", "--key", str(pem), "--statement", str(run / "book-bundle-buyer.checkpoint.cose"),
+                     "--at", "1793937188"], capture_output=True, text=True, check=True).stdout)
+                b = bundle(run)
+                b["checkpoint"]["witnesses"] = [{"ts_url": "http://127.0.0.1:1", "entry_hash": got["entry_hash"],
+                                                 "receipt_b64": got["receipt_b64"], "leaf_index": got["leaf_index"],
+                                                 "tree_size": got["tree_size"]}]
+                save(run, b)
+                pub = subprocess.run(["openssl", "pkey", "-in", str(pem), "-pubout", "-outform", "DER"],
+                                     capture_output=True, check=True).stdout[-32:].hex()
+                (run / "witnesses.json").write_text(json.dumps({"witnesses": [{
+                    "name": "w", "key_id": pub, "not_before": "2026-01-01T00:00:00Z"}]}))
+            return mutate
+
+        def other_checkpoint_key(run, book):
+            book["checkpoint_key"] = "11" * 32
+
+        def other_book(run, book):
+            book["book_id"] = "goose/other"
+
+        def other_capsule(run, book):
+            c = json.loads(Path(book["capsule"]).read_text())
+            c["capsule_id"] = "22" * 32
+            (run / "other-capsule.json").write_text(json.dumps(c))
+            book["capsule"] = str(run / "other-capsule.json")
+
+        def altered_receipt(run, book):  # the receipt's entry hash is not the bundle checkpoint's
+            b = bundle(run)
+            b["checkpoint"]["witnesses"][0]["entry_hash"] = "33" * 32
+            save(run, b)
+
+        for name, mutate, broken in (("altered", altered, {"bundle"}), ("unlisted", unlisted, {"witness_listed"}),
+                                     ("notyet", not_yet, {"witness_not_before"}),
+                                     ("buyerkey", signed_by(self.work / "keys" / "buyer" / "node-key.pem"), {"witness_not_node"}),
+                                     ("sellerkey", signed_by(self.work / "keys" / "seller" / "node-key.pem"), {"witness_not_node"}),
+                                     ("sellercheckpointkey", signed_by(self.work / "run" / "seller" / "checkpoint.key"), {"witness_not_node"}),
+                                     ("cpkey", other_checkpoint_key, {"checkpoint"}), ("otherbook", other_book, {"position"}),
+                                     ("othercapsule", other_capsule, {"record"}), ("receipt", altered_receipt, {"witness_signature"})):
+            with self.subTest(name):
+                found, checks = self._planted(name, mutate)
+                self.assertEqual(found["result"], "FAIL", found["detail"])
+                self.assertLessEqual(broken, {n for n, c in checks.items() if not c["ok"]}, checks)
+
+    def test_step_02_is_not_checked_when_the_run_wrote_no_book_bundle(self):
+        doc = json.loads((self.pop / "population.json").read_text())
+        doc["goose"].pop("book", None)
+        pop = self.work / "nobook-pop"
+        pop.mkdir()
+        (pop / "population.json").write_text(json.dumps(doc))
+        _, found = self._step_02(pop, "findings-nobook")
+        self.assertEqual(found["result"], "NOT_CHECKED", found["detail"])
+
+    def test_step_02_is_not_checked_on_a_checkout_other_than_the_pin(self):
+        doc = json.loads((self.pop / "population.json").read_text())
+        doc["goose"]["rev"] = "0" * 40
+        pop = self.work / "otherrev-pop"
+        pop.mkdir()
+        (pop / "population.json").write_text(json.dumps(doc))
+        _, found = self._step_02(pop, "findings-otherrev")
+        self._step_02_ready()
+        self.assertEqual(found["result"], "NOT_CHECKED", found["detail"])
+        self.assertEqual(found["not_checked"][0]["what"], "goose-g1")
+
+    def test_a_run_without_a_usable_step_02_driver_still_passes_step_03_and_step_02_says_not_checked(self):
+        for name, bin_ in (("missing", self.work / "no-such-driver"), ("plain-file", self.work / "plain")):
+            with self.subTest(name):
+                if name == "plain-file":
+                    bin_.write_text("")  # exists, but is not executable
+                work = self.work / f"nodriver-{name}"
+                env = {**os.environ, "LOOP_STEP02_BOOK_BIN": str(bin_)}
+                r = subprocess.run([sys.executable, "-B", str(ROOT / "scripts/goose_rehearsal.py"), "--work", str(work)],
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                pop = work / "population"
+                self.assertNotIn("book", json.loads((pop / "population.json").read_text())["goose"])
+                for step, result in (("02-book", "NOT_CHECKED"), ("03-advertise", "PASS")):
+                    out = work / "findings" / step
+                    done = subprocess.run([str(ROOT / "steps" / step), "--population", str(pop), "--out", str(out)],
+                                          stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(json.loads((out / "finding.json").read_text())["result"], result)
 
     def test_step_07_passes_on_asks_the_goose_nodes_answer_by_polling_their_mailboxes(self):
         out = self.work / "findings" / "07-ask"

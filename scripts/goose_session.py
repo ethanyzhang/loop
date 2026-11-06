@@ -15,13 +15,21 @@ import asyncio
 import json
 import os
 import sys
+import threading
+from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "population" / "rehearsal" / "rail"))
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "lab"))
 import make_rail  # noqa: E402
 import mock_rail  # noqa: E402
+import witness as lab_witness  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
+from cryptography.hazmat.primitives.serialization import (  # noqa: E402
+    Encoding, NoEncryption, PrivateFormat, PublicFormat)
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
@@ -58,11 +66,37 @@ def issue_settlement(rail_dir, deal_id, payer, payee):
     return line
 
 
+def start_witness(out, driver):
+    """The rehearsal's test witness for step 02: the lab witness's handler (lab/witness.py) on a loopback port, over plain
+    HTTP (the Goose node's witness client takes http and https), signing with a key made for this run and held apart from
+    both nodes. Returns (server, the directory file the nodes check receipts under); the step's listing of the witness key is
+    written beside it as witnesses.json."""
+    key = out / "witness-key.pem"
+    private = Ed25519PrivateKey.generate()
+    key.write_bytes(private.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    key.chmod(0o600)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), lab_witness.handler(str(driver), str(key), None))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    key_id = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    not_before = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # receipts count from the witness's start
+    directory = out / "witnesses-directory.json"
+    directory.write_text(json.dumps({"witnesses": [{"name": "goose-rehearsal-witness", "key_ids": [key_id],
+                                                    "endpoint": f"http://127.0.0.1:{server.server_port}"}]}))
+    (out / "witnesses.json").write_text(json.dumps({"witnesses": [{
+        "name": "goose-rehearsal-witness", "key_id": key_id, "not_before": not_before}]}, indent=2) + "\n")
+    return server, directory
+
+
 async def run(out, rail_dir):
     out.mkdir(parents=True, exist_ok=True)
+    driver = Path(os.environ.get("LOOP_STEP02_BOOK_BIN") or Path(os.environ.get(
+        "LOOP_TOOLS", Path.home() / ".cache" / "evidence-network-loop")) / "02-book" / "bin" / "loop-step02-book")
+    witness, directory = start_witness(out, driver) if driver.is_file() and os.access(driver, os.X_OK) else (None, None)
 
     def params(name):
         env = {**os.environ, "GOOSE_HOME": str(out / name), "GOOSE_OPERATOR": f"goose-{name}"}
+        if directory:
+            env["GOOSE_WITNESSES"] = str(directory)
         return StdioServerParameters(command=sys.executable, args=[str(SRC / "loop_server.py")], env=env)
 
     async with stdio_client(params("buyer")) as (br, bw), stdio_client(params("seller")) as (sr, sw):
@@ -77,9 +111,12 @@ async def run(out, rail_dir):
                               decision="GO", reason="paying customer")
             # 01: the buyer seals a model call, an effect-boundary record step 01 reads. Provider and model are what
             # the step tells the producer (steps/01-seal MODEL); model_attestation must carry them back.
-            await buyer.call("loop_seal", provider="rehearsal", model_id="rehearsal-model",
-                             prompt="rehearsal inference", completion="rehearsal completion",
-                             out_path=str(out / "sealed-buyer.json"))
+            sealed = await buyer.call("loop_seal", provider="rehearsal", model_id="rehearsal-model",
+                                      prompt="rehearsal inference", completion="rehearsal completion",
+                                      out_path=str(out / "sealed-buyer.json"))
+            if witness:  # 02: the sealed call's place in the buyer's book, its checkpoint and the witness's receipt
+                await buyer.call("loop_book_bundle", book_id="goose/node", record_id=sealed["record_id"],
+                                 out_path=str(out / "book-bundle-buyer.json"))
             opened = await buyer.call("loop_deal_open", peer_key_id=s["key_id"], item="inference: 1k tokens",
                                       price_minor=PRICE_MINOR, currency=CURRENCY, rail="mock",
                                       asked="buy 1k tokens of inference from the seller")
@@ -116,8 +153,11 @@ async def run(out, rail_dir):
                 await node.call("loop_history_card", book_id=f"deal/{deal_id}",
                                 out_path=str(out / f"{node.name}-history-card.json"))
                 (out / f"{node.name}.key").write_text(key["key_id"])
+                (out / f"{node.name}.checkpoint-key").write_text(key["checkpoint_key_id"])
                 # 03: the node's own signed commitment and policy (loop_advertise), laid out for nodes/commitments/.
                 await node.call("loop_advertise", out_dir=str(out / "commitments"))
+    if witness:
+        witness.shutdown()
     (out / "deal.json").write_text(json.dumps({"deal_id": deal_id, "buyer": b["key_id"], "seller": s["key_id"],
                                                "settlement_id": settlement["settlement_id"]}, sort_keys=True))
 
