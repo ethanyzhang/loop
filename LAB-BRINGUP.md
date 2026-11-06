@@ -613,7 +613,15 @@ names the one gap outside it (no public ledger, loop#247). `pack` takes
 What a paid exchange costs, measured live on 2026-11-01 (loop#300; lab-2 pays,
 lab-1 sells the Qwen model; the lab host build's mesh-llm payments code):
 - The loop sets no amount. `lab.sh exchange` sends one `max_tokens` 8 request from
-  each of lab-2 and lab-3; only lab-2 has a wallet, so one exchange is paid. For a
+  each of lab-2 and lab-3; both have a wallet and both pay 1,000 msat. Only lab-1 sells, so
+  at the end of each daily run `scripts/lab_circulate.py` has lab-1 pay lab-3 the same
+  1,000 msat back, once, when lab-3's request was answered 200 (its charge settled), and
+  nothing otherwise, through the guarded lab-to-lab payment (`goose_lightning.py`, counted
+  in the Goose payment log; lab-3 receives about 900 of it after a receive fee of 100 msat,
+  seen on 2026-11-06). No balance or ledger is read to decide, and lab-3 earns nothing as a
+  seller (that would need a node restart). With no funds lab-3's charge row goes to `failed`
+  and lab-1 answers 402 (loop#384); the run record shows each asker's status
+  (`exchange.askers`) and the payment's outcome (`circulate`). For a
   cold peer the amount is lab-1's admission deposit for the model: its own
   deposit, else the node-wide `admission-deposit`, else the minimum payment, and
   never below the minimum payment. The minimum payment is 1,000 msat by default,
@@ -632,8 +640,9 @@ lab-1 sells the Qwen model; the lab host build's mesh-llm payments code):
   leaves a payment hash in the payer's book alone, which step 06 reads as unproven
   (`finality`) and unpaired (`exchange_match`), so do not probe on the live lab
   before a run.
-- Only lab-1 serves a model, so payments go lab-2 to lab-1 (or lab-3 to lab-1,
-  which has no wallet); the wallets cannot ping-pong today.
+- Only lab-1 serves a model, so exchanges go lab-2 to lab-1 and lab-3 to lab-1; lab-1's
+  earnings go back to lab-3 through `scripts/lab_circulate.py` (above), so value circulates
+  between the lab wallets, but lab-2 and lab-3 do not sell.
 - The lab payment guard (Ethan, 2026-11-01) is at most 3,000 msat per payment and
   at most 9,000 msat per direction per UTC day, not lifetime. It matches lab-2's
   wallet policy `daily_budget_msat` 9,000 (`wallet policy`), which the wallet
@@ -725,10 +734,10 @@ clones do not change, but `$LAB_DIR/build.json` holds one `tools` record, which
 reads `"ok": false` (and `entries` refuses) until a `tools` run passes, and the
 other way round. Its `loop_tools` field names the directory that wrote it.
 Then the run does `lab.sh check` and `lab.sh running` (every node up on the checked build, and the test witness serving its port when the lab has one: `lab.sh stop` kills the witness and `start` does not bring it back, so run `lab/lab.sh witness` after a restart or the run exits 5 before it spends), and makes one paid
-exchange: lab-2 pays lab-1 1,000 msat, and the run never retries it. After the checkpoints it runs steps 04 to 06,
+exchange: lab-2 pays lab-1 1,000 msat, and the run never retries it (lab-3 asks too and pays 1,000 msat when it has funds). After the checkpoints it runs steps 04 to 06,
 09, stage 1 (01, 02, 03, 12, 07, then 08) and 10 and 11 into `findings/<date>-live-<N>`, judged from the run's start.
 Step 08 stays NOT_CHECKED (evidence-network/loop#193). The tarball and the run record go to `$LAB_DIR/out/live/`;
-the script commits and pushes nothing, and leaves no findings in the clone (the tarball holds them; a run that
+after the steps it makes a second real payment, lab-1 to lab-3, 1,000 msat once, when lab-3's request was answered 200 (`scripts/lab_circulate.py`; its outcome is `circulate` in the run record, and a refusal never changes the exit code; "the lab is not idle" is expected until lab-3's unpaid probe invoice expires on 2026-11-07 at 16:17 UTC, so the 2026-11-08 run is the first that can pay, and it is not a failed run); the script commits and pushes nothing, and leaves no findings in the clone (the tarball holds them; a run that
 stopped before packing leaves them in `$LAB_DIR/out/live/unpacked/<name>`). When the paid request does not succeed, step 06 is NOT_CHECKED with the
 status seen (evidence-network/loop#321), and the run exits 8 (1 if another step also regressed): packed, but the
 baseline must not move. The script's
